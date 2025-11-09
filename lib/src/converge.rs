@@ -37,6 +37,7 @@ use jj_lib::evolution::walk_predecessors;
 use jj_lib::graph_dominators::FlowGraph;
 use jj_lib::graph_dominators::FlowGraphError;
 use jj_lib::graph_dominators::SimpleDirectedGraph;
+use jj_lib::graph_dominators::ValueFlowGraph;
 use jj_lib::graph_dominators::find_closest_common_dominator;
 use jj_lib::merge::Merge;
 use jj_lib::merge::MergeBuilder;
@@ -611,7 +612,6 @@ where
     Ok(merge.resolve_trivial(SameChange::Accept).cloned())
 }
 
-#[allow(unused)]
 fn find_dominator_value<T, VF>(
     graph: &TruncatedEvolutionGraph,
     value_fn: &VF,
@@ -620,7 +620,11 @@ where
     T: Eq + Hash + Clone,
     VF: Fn(&Commit) -> Result<T, ConvergeError>,
 {
-    todo!();
+    let value_fn = |commit_id: &CommitId| value_fn(graph.get_commit(commit_id)?);
+    let flow_graph = FlowGraph::new(graph.graph.clone(), graph.evolution_fork_point.clone())?;
+    let dominator_value = ValueFlowGraph::new(&flow_graph, &value_fn)?
+        .find_dominator_value(&graph.divergent_commit_ids)?;
+    Ok(dominator_value)
 }
 
 fn converge_interactively<T, F>(
