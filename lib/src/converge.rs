@@ -16,16 +16,19 @@
 //! <https://github.com/jj-vcs/jj/blob/main/docs/design/jj-converge-command.md>
 //! for more details.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::hash::Hash;
 use std::ops::Deref as _;
 use std::sync::Arc;
 
+use futures::future::try_join_all;
 use indexmap::IndexMap;
 use indexmap::IndexSet;
 use itertools::Itertools as _;
 use jj_lib::backend::BackendError;
+use jj_lib::backend::BackendResult;
 use jj_lib::backend::ChangeId;
 use jj_lib::backend::CommitId;
 use jj_lib::backend::Signature;
@@ -51,6 +54,8 @@ use jj_lib::revset::ResolvedRevsetExpression;
 use jj_lib::revset::RevsetEvaluationError;
 use jj_lib::revset::RevsetExpression;
 use jj_lib::revset::RevsetIteratorExt as _;
+use jj_lib::rewrite::merge_commit_trees_no_resolve;
+use jj_lib::store::Store;
 use pollster::FutureExt as _;
 use thiserror::Error;
 
@@ -555,6 +560,30 @@ fn converge_parents(
     converge_interactively(converge_ui, ui_chooser, "parents")
 }
 
+/// A MergedTree, without the Arc<Store>. That allows us to derive Eq and Hash
+/// for it, which we need in some algorithms.
+#[derive(Eq, Hash, PartialEq, Clone)]
+struct TreeIdsAndLabels {
+    tree_ids: Merge<TreeId>,
+    labels: ConflictLabels,
+}
+
+impl TreeIdsAndLabels {
+    fn new(merged_tree: MergedTree) -> Self {
+        let (tree_ids, labels) = merged_tree.into_tree_ids_and_labels();
+        Self { tree_ids, labels }
+    }
+
+    fn from_commit(commit: &Commit) -> Self {
+        let (tree_ids, labels) = commit.tree().into_tree_ids_and_labels();
+        Self { tree_ids, labels }
+    }
+
+    fn to_merged_tree(&self, store: &Arc<Store>) -> MergedTree {
+        MergedTree::new(store.clone(), self.tree_ids.clone(), self.labels.clone())
+    }
+}
+
 // Assume A, B, C are the divergent commits, P is the solution parents (i.e. the
 // parents chosen by converge_parents), and F is a commit chosen as a "good base
 // for converging trees" as explained below.
@@ -587,12 +616,129 @@ fn converge_parents(
 //    truncated evolution graph
 // 5. F is any of those producer commits (we pick the first one)
 async fn converge_trees(
-    _repo: &Arc<ReadonlyRepo>,
-    _divergent_commits: &[Commit],
-    _truncated_evolution_graph: &TruncatedEvolutionGraph,
-    _parents: &[CommitId],
+    repo: &Arc<ReadonlyRepo>,
+    divergent_commits: &[Commit],
+    truncated_evolution_graph: &TruncatedEvolutionGraph,
+    parents: &[CommitId],
 ) -> Result<MergedTree, ConvergeError> {
-    todo!()
+    let parent_commits: Vec<Commit> =
+        try_join_all(parents.iter().map(|id| repo.store().get_commit_async(id))).await?;
+    let parents_merged_tree = merge_commit_trees_no_resolve(repo.as_ref(), &parent_commits).await?;
+
+    // We first compute the dominator value of the trees (in the value history graph
+    // of the trees), together with the commit(s) that produce that tree. Any
+    // such commit is a good candidate to be used as the base of the merge.
+
+    let rebase_tree_fn = |c: &Commit| -> Result<TreeIdsAndLabels, ConvergeError> {
+        if c.parent_ids() == parents {
+            Ok(TreeIdsAndLabels::from_commit(c))
+        } else {
+            Ok(TreeIdsAndLabels::new(
+                rebase_tree_onto_solution_parents(c, &parents_merged_tree, repo).block_on()?,
+            ))
+        }
+    };
+    let drop_labels_fn =
+        |tree_ids_and_labels: &TreeIdsAndLabels| Ok(tree_ids_and_labels.tree_ids.clone());
+
+    let rebased_resolved_trees = RefCell::new(KeyValueMultimap::new(
+        divergent_commits
+            .iter()
+            .map(|c| Ok((c.id().clone(), rebase_tree_fn(c)?))),
+    )?);
+    let rebased_resolved_tree_ids =
+        RefCell::new(rebased_resolved_trees.borrow().remap(drop_labels_fn)?);
+
+    if rebased_resolved_tree_ids.borrow().num_values() == 1 {
+        // All commits have the same rebased resolved tree, so we can skip the
+        // more expensive dominator calculation and just use that tree as the
+        // solution.
+        let c = &divergent_commits[0];
+        return Ok(rebased_resolved_trees
+            .borrow()
+            .get_value(c.id())
+            .cloned()
+            .unwrap()
+            .to_merged_tree(c.store()));
+    }
+
+    let value_fn = |c: &Commit| -> Result<Merge<TreeId>, ConvergeError> {
+        let tree_ids_and_labels = rebased_resolved_trees
+            .borrow_mut()
+            .get_value_or_insert_with(c.id(), || rebase_tree_fn(c))?;
+        let tree_ids = drop_labels_fn(&tree_ids_and_labels)?;
+        rebased_resolved_tree_ids
+            .borrow_mut()
+            .insert_if_absent(c.id(), &tree_ids)?;
+        Ok(tree_ids)
+    };
+
+    let flow_graph = FlowGraph::new(
+        truncated_evolution_graph.graph.clone(),
+        truncated_evolution_graph.evolution_fork_point.clone(),
+    )?;
+    let dominator_tree_ids = ValueFlowGraph::new(&flow_graph, &|commit_id| {
+        value_fn(truncated_evolution_graph.get_commit(commit_id)?)
+    })?
+    .find_dominator_value(&truncated_evolution_graph.divergent_commit_ids)?
+    .unwrap();
+    let dominator_producers = rebased_resolved_tree_ids
+        .borrow()
+        .get_keys_for_value(&dominator_tree_ids)
+        .unwrap()
+        .clone();
+    if dominator_producers.is_empty() {
+        return Err(ConvergeError::Other(
+            "Unexpected error: no producer commits found for the dominator tree".into(),
+        ));
+    }
+
+    // The first "producer" is the base of our merge of trees.
+    let base_commit = truncated_evolution_graph.get_commit(&dominator_producers[0])?;
+
+    let mut terms: Vec<(MergedTree, String)> = Vec::new();
+    let base_term = get_term_for_tree_merge(
+        base_commit,
+        parents,
+        &rebased_resolved_trees.borrow(),
+        "converge base",
+    );
+
+    // Add
+    terms.push(base_term.clone());
+    for divergent_commit in divergent_commits {
+        // Remove
+        terms.push(base_term.clone());
+        // Add
+        terms.push(get_term_for_tree_merge(
+            divergent_commit,
+            parents,
+            &rebased_resolved_trees.borrow(),
+            "divergent commit",
+        ));
+    }
+    Ok(MergedTree::merge(MergeBuilder::from_iter(terms).build()).await?)
+}
+
+fn get_term_for_tree_merge(
+    commit: &Commit,
+    parents: &[CommitId],
+    rebased_resolved_trees: &KeyValueMultimap<CommitId, TreeIdsAndLabels>,
+    prefix: &str,
+) -> (MergedTree, String) {
+    let rebased_and_resolved_tree = rebased_resolved_trees
+        .get_value(commit.id())
+        .unwrap()
+        .to_merged_tree(commit.store());
+    let conflict_label = if commit.parent_ids() == parents {
+        format!("{prefix}: {}", commit.conflict_label())
+    } else {
+        format!(
+            "{prefix}: tree of {} rebased onto parents",
+            commit.conflict_label()
+        )
+    };
+    (rebased_and_resolved_tree, conflict_label)
 }
 
 fn converge<T, VF>(
@@ -642,6 +788,27 @@ where
     Ok(dominator_value)
 }
 
+async fn rebase_tree_onto_solution_parents(
+    c: &Commit,
+    parents_merged_tree: &MergedTree,
+    repo: &Arc<ReadonlyRepo>,
+) -> BackendResult<MergedTree> {
+    let mut terms: Vec<(MergedTree, String)> = Vec::new();
+    // Add
+    terms.push((
+        parents_merged_tree.clone(),
+        "converge solution parent(s)".to_string(),
+    ));
+    // Remove
+    terms.push((
+        c.parent_tree_no_resolve(repo.as_ref()).await?,
+        c.parents_conflict_label().await?,
+    ));
+    // Add
+    terms.push((c.tree(), c.conflict_label()));
+    MergedTree::merge(MergeBuilder::from_iter(terms).build()).await
+}
+
 /// Returns those commits in commit_ids that are not descendants of any other
 /// commit in commit_ids.
 pub fn remove_descendants(
@@ -689,5 +856,105 @@ fn validate(predicate: bool, msg: &str) -> Result<(), ConvergeError> {
         Err(ConvergeError::Other(msg.into()))
     } else {
         Ok(())
+    }
+}
+
+struct KeyValueMultimap<K, V> {
+    value_to_keys: HashMap<V, Vec<K>>,
+    key_to_value: HashMap<K, V>,
+}
+
+impl<K, V> KeyValueMultimap<K, V>
+where
+    K: Eq + Hash + Clone + std::fmt::Display,
+    V: Eq + Hash + Clone,
+{
+    fn new<II>(items: II) -> Result<Self, ConvergeError>
+    where
+        II: IntoIterator<Item = Result<(K, V), ConvergeError>>,
+    {
+        let mut key_to_value = HashMap::new();
+        let mut value_to_keys: HashMap<V, Vec<K>> = HashMap::new();
+        for item in items {
+            let (key, value) = item?;
+            Self::insert_if_absent_internal(&mut value_to_keys, &mut key_to_value, &key, &value)?;
+        }
+        Ok(Self {
+            key_to_value,
+            value_to_keys,
+        })
+    }
+
+    fn num_values(&self) -> usize {
+        self.value_to_keys.len()
+    }
+
+    fn get_value(&self, key: &K) -> Option<&V> {
+        self.key_to_value.get(key)
+    }
+
+    fn get_value_or_insert_with<VF>(&mut self, key: &K, value_fn: VF) -> Result<V, ConvergeError>
+    where
+        VF: FnOnce() -> Result<V, ConvergeError>,
+    {
+        match self.key_to_value.entry(key.clone()) {
+            std::collections::hash_map::Entry::Occupied(occupied_entry) => {
+                Ok(occupied_entry.get().clone())
+            }
+            std::collections::hash_map::Entry::Vacant(vacant_entry) => {
+                let value = vacant_entry.insert(value_fn()?);
+                self.value_to_keys
+                    .entry(value.clone())
+                    .or_default()
+                    .push(key.clone());
+                Ok(value.clone())
+            }
+        }
+    }
+
+    fn insert_if_absent(&mut self, key: &K, value: &V) -> Result<(), ConvergeError> {
+        Self::insert_if_absent_internal(&mut self.value_to_keys, &mut self.key_to_value, key, value)
+    }
+
+    fn insert_if_absent_internal(
+        value_to_keys: &mut HashMap<V, Vec<K>>,
+        key_to_value: &mut HashMap<K, V>,
+        key: &K,
+        value: &V,
+    ) -> Result<(), ConvergeError> {
+        let key_to_value_entry = match key_to_value.entry(key.clone()) {
+            std::collections::hash_map::Entry::Occupied(occupied) => {
+                if value == occupied.get() {
+                    return Ok(());
+                }
+                return Err(ConvergeError::Other(
+                    format!("Duplicate key found: {key}").into(),
+                ));
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => entry,
+        };
+        key_to_value_entry.insert(value.clone());
+        value_to_keys
+            .entry(value.clone())
+            .or_default()
+            .push(key.clone());
+        Ok(())
+    }
+
+    fn get_keys_for_value(&self, value: &V) -> Option<&Vec<K>> {
+        self.value_to_keys.get(value)
+    }
+
+    fn remap<V2, VF>(&self, value_fn: VF) -> Result<KeyValueMultimap<K, V2>, ConvergeError>
+    where
+        VF: Fn(&V) -> Result<V2, ConvergeError>,
+        V2: Eq + Hash + Clone,
+    {
+        let mut remapped_items = Vec::with_capacity(self.key_to_value.len());
+        for (key, value) in &self.key_to_value {
+            let remapped_value = value_fn(value)?;
+            remapped_items.push(Ok((key.clone(), remapped_value)));
+        }
+        KeyValueMultimap::new(remapped_items)
     }
 }
