@@ -272,7 +272,7 @@ fn test_reparent_range_linear() {
     let read_op = |id| loader.load_operation(id).block_on().unwrap();
 
     fn op_parents<const N: usize>(op: &Operation) -> [Operation; N] {
-        let parents: Vec<_> = op.parents().try_collect().unwrap();
+        let parents = op.parents().block_on().unwrap();
         parents.try_into().unwrap()
     }
 
@@ -340,7 +340,7 @@ fn test_reparent_range_branchy() {
     let read_op = |id| loader.load_operation(id).block_on().unwrap();
 
     fn op_parents<const N: usize>(op: &Operation) -> [Operation; N] {
-        let parents: Vec<_> = op.parents().try_collect().unwrap();
+        let parents = op.parents().block_on().unwrap();
         parents.try_into().unwrap()
     }
 
@@ -886,7 +886,7 @@ fn test_walk_ancestors() {
     let loader = repo_0.loader();
 
     fn op_parents<const N: usize>(op: &Operation) -> [Operation; N] {
-        let parents: Vec<_> = op.parents().try_collect().unwrap();
+        let parents = op.parents().block_on().unwrap();
         parents.try_into().unwrap()
     }
 
