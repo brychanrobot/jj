@@ -1451,6 +1451,6 @@ fn test_compute_changed_line_ranges() {
     // Remove last line from file.
     assert_eq!(
         compute_changed_ranges(b"a\n", b""),
-        RegionsToFormat::NoRegions
+        RegionsToFormat::LineRanges(vec![])
     );
 }

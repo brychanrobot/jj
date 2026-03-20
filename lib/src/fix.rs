@@ -390,8 +390,6 @@ pub async fn fix_files(
 pub enum RegionsToFormat {
     /// Line ranges (1-based, inclusive [first, last]).
     LineRanges(Vec<LineRange>),
-    /// No regions to format.
-    NoRegions,
 }
 
 /// A formattable range of lines or bytes.
@@ -418,7 +416,7 @@ pub type LineRange = FormatRange;
 pub fn compute_changed_ranges(base: &[u8], current: &[u8]) -> RegionsToFormat {
     let mut ranges: Vec<LineRange> = Vec::new();
     if current.is_empty() {
-        return RegionsToFormat::NoRegions;
+        return RegionsToFormat::LineRanges(ranges);
     }
 
     let diff = ContentDiff::by_line([base, current]);

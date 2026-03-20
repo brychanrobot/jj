@@ -288,26 +288,32 @@ async fn fix_one_file(
         .filter(|tool_config| tool_config.matcher.matches(&file_to_fix.repo_path))
         .peekable();
 
-    if matching_tools.peek().is_some() {
-        // The first matching tool gets its input from the committed file, and any
-        // subsequent matching tool gets its input from the previous matching tool's
-        // output.
+    if matching_tools.peek().is_none() {
+        return Ok(None);
+    }
 
-        // TODO: Consider adding a check for some max file size config or some global
-        // limit for both `old_content` and `base_content`.
-        let mut old_content = vec![];
-        let mut read = store
-            .read_file(&file_to_fix.repo_path, &file_to_fix.file_id)
-            .await?;
-        read.read_to_end(&mut old_content).await?;
+    // The first matching tool gets its input from the committed file, and any
+    // subsequent matching tool gets its input from the previous matching tool's
+    // output.
 
-        // Do not run any tools on empty files.
-        if old_content.is_empty() {
-            return Ok(None);
-        }
+    // TODO: Consider adding a check for some max file size config or some global
+    // limit for both `old_content` and `base_content`.
+    let mut old_content = vec![];
+    let mut read = store
+        .read_file(&file_to_fix.repo_path, &file_to_fix.file_id)
+        .await?;
+    read.read_to_end(&mut old_content).await?;
 
-        // Load the base content from the file_to_fix (if exists) iff any tool needs it.
-        let base_content = match &file_to_fix.base_file_id {
+    // Do not run any tools on empty files.
+    if old_content.is_empty() {
+        return Ok(None);
+    }
+
+    // Load the base content from the file_to_fix (if exists) iff any tool needs it.
+    let base_content = if all_lines_arg {
+        None
+    } else {
+        match &file_to_fix.base_file_id {
             Some(base_file_id) if matching_tools.clone().any(|t| t.line_range_arg.is_some()) => {
                 let mut content = vec![];
                 let mut read = store
@@ -317,105 +323,77 @@ async fn fix_one_file(
                 Some(content)
             }
             _ => None,
-        };
-
-        let new_content = matching_tools.fold(old_content.clone(), |prev_content, tool_config| {
-            let mut extra_args = Vec::new();
-
-            if let Some(line_range_arg) = &tool_config.line_range_arg {
-                let ranges = match compute_regions_to_format(
-                    base_content.as_deref(),
-                    &prev_content,
-                    ComputeRegionsToFormatOptions {
-                        all_lines: all_lines_arg,
-                        run_tool_if_zero_line_ranges: tool_config.run_tool_if_zero_line_ranges,
-                    },
-                ) {
-                    RegionsToFormat::LineRanges(ranges) => ranges,
-                    RegionsToFormat::NoRegions => return prev_content,
-                };
-
-                for range in ranges {
-                    extra_args.push(
-                        line_range_arg
-                            .replace("$first", &range.first.to_string())
-                            .replace("$last", &range.last.to_string()),
-                    );
-                }
-            }
-
-            match run_tool(
-                ui,
-                workspace_root,
-                path_converter,
-                &tool_config.command,
-                file_to_fix,
-                &prev_content,
-                &extra_args,
-            ) {
-                Ok(next_content) => next_content,
-                // TODO: Because the stderr is passed through, this isn't always failing
-                // silently, but it should do something better will the exit code, tool
-                // name, etc.
-                Err(()) => prev_content,
-            }
-        });
-
-        if new_content != old_content {
-            // TODO: send futures back over channel
-            let new_file_id = store
-                .write_file(&file_to_fix.repo_path, &mut new_content.as_slice())
-                .await?;
-            return Ok(Some(new_file_id));
         }
-    }
-    Ok(None)
-}
+    };
 
-/// Additional arguments for computing the modified line ranges between the base
-/// and current file.
-#[derive(Debug, Clone, Copy)]
-pub struct ComputeRegionsToFormatOptions {
-    /// Whether to compute the modified line ranges for all lines.
-    pub all_lines: bool,
-    /// Whether to run the tool invocation if there are zero line ranges to
-    /// format. For example, some tools want to sort imports even if there are
-    /// zero line ranges to format.
-    pub run_tool_if_zero_line_ranges: bool,
+    let new_content = matching_tools.fold(old_content.clone(), |prev_content, tool_config| {
+        let mut extra_args = Vec::new();
+
+        if let Some(line_range_arg) = &tool_config.line_range_arg {
+            let RegionsToFormat::LineRanges(ranges) =
+                compute_regions_to_format(base_content.as_deref(), &prev_content);
+            if ranges.is_empty() && !tool_config.run_tool_if_zero_line_ranges {
+                // Don't run the tool if there are no line ranges to format and the tool is
+                // configured to not run in that case.
+                return prev_content;
+            }
+
+            for range in ranges {
+                extra_args.push(
+                    line_range_arg
+                        .replace("$first", &range.first.to_string())
+                        .replace("$last", &range.last.to_string()),
+                );
+            }
+        }
+
+        match run_tool(
+            ui,
+            workspace_root,
+            path_converter,
+            &tool_config.command,
+            file_to_fix,
+            &prev_content,
+            &extra_args,
+        ) {
+            Ok(next_content) => next_content,
+            // TODO: Because the stderr is passed through, this isn't always failing
+            // silently, but it should do something better will the exit code, tool
+            // name, etc.
+            Err(()) => prev_content,
+        }
+    });
+
+    if new_content != old_content {
+        // TODO: send futures back over channel
+        let new_file_id = store
+            .write_file(&file_to_fix.repo_path, &mut new_content.as_slice())
+            .await?;
+        return Ok(Some(new_file_id));
+    }
+
+    Ok(None)
 }
 
 /// Computes the modified line ranges between the base and current file.
 pub fn compute_regions_to_format(
     base_content: Option<&[u8]>,
     current_content: &[u8],
-    options: ComputeRegionsToFormatOptions,
 ) -> RegionsToFormat {
-    if !options.all_lines
-        && let Some(base) = base_content
-    {
-        let changed_ranges = match compute_changed_ranges(base, current_content) {
-            RegionsToFormat::LineRanges(ranges) => ranges,
-            RegionsToFormat::NoRegions => return RegionsToFormat::NoRegions,
-        };
-
+    if current_content.is_empty() {
+        RegionsToFormat::LineRanges(vec![])
+    } else if let Some(base) = base_content {
         // If the tool is configured to not run the tool invocation if there are zero
         // line ranges to format, we want to return NoRegions. Otherwise, we want to
         // run the tool on the changed ranges.
-        if changed_ranges.is_empty() && !options.run_tool_if_zero_line_ranges {
-            return RegionsToFormat::NoRegions;
-        }
-        return RegionsToFormat::LineRanges(changed_ranges);
-    }
-
-    // Format the entire file.
-    let line_count = compute_file_line_count(current_content);
-    if line_count > 0 {
+        compute_changed_ranges(base, current_content)
+    } else {
+        // Format the entire file.
+        let line_count = compute_file_line_count(current_content);
         RegionsToFormat::LineRanges(vec![LineRange {
             first: 1,
             last: line_count,
         }])
-    } else {
-        RegionsToFormat::NoRegions
     }
 }
 
@@ -619,97 +597,40 @@ mod tests {
 
     #[test]
     fn test_compute_regions_to_format_default() {
-        let options = ComputeRegionsToFormatOptions {
-            all_lines: false,
-            run_tool_if_zero_line_ranges: false,
-        };
-
         // Base content None.
         assert_eq!(
-            compute_regions_to_format(None, b"a\nb\nc\n", options),
+            compute_regions_to_format(None, b"a\nb\nc\n"),
             RegionsToFormat::LineRanges(vec![line_range(1, 3)])
         );
 
         // Empty base content.
         assert_eq!(
-            compute_regions_to_format(Some(b""), b"a\nb\nc\n", options),
+            compute_regions_to_format(Some(b""), b"a\nb\nc\n"),
             RegionsToFormat::LineRanges(vec![line_range(1, 3)])
         );
 
         // Modified base content.
         assert_eq!(
-            compute_regions_to_format(Some(b"a\nB\nc\n"), b"a\nb\nc\n", options),
+            compute_regions_to_format(Some(b"a\nB\nc\n"), b"a\nb\nc\n"),
             RegionsToFormat::LineRanges(vec![line_range(2, 2)])
         );
 
         // Deleted base content.
         assert_eq!(
-            compute_regions_to_format(Some(b"a\nb\nc\nd\n"), b"a\nb\nc\n", options),
-            RegionsToFormat::NoRegions
+            compute_regions_to_format(Some(b"a\nb\nc\nd\n"), b"a\nb\nc\n"),
+            RegionsToFormat::LineRanges(vec![])
         );
 
         // Multiple line ranges.
         assert_eq!(
-            compute_regions_to_format(Some(b"A\nb\nC\n"), b"a\nb\nc\n", options),
+            compute_regions_to_format(Some(b"A\nb\nC\n"), b"a\nb\nc\n"),
             RegionsToFormat::LineRanges(vec![line_range(1, 1), line_range(3, 3)])
         );
 
         // Deleted current content.
         assert_eq!(
-            compute_regions_to_format(Some(b"a\nb\nc\n"), b"", options),
-            RegionsToFormat::NoRegions
-        );
-    }
-
-    #[test]
-    fn test_compute_regions_to_format_all_lines() {
-        let options = ComputeRegionsToFormatOptions {
-            all_lines: true,
-            run_tool_if_zero_line_ranges: false,
-        };
-
-        // Empty base content.
-        assert_eq!(
-            compute_regions_to_format(Some(b""), b"a\nb\nc\n", options),
-            RegionsToFormat::LineRanges(vec![line_range(1, 3)])
-        );
-
-        // Modified base content.
-        assert_eq!(
-            compute_regions_to_format(Some(b"a\nB\nc\n"), b"a\nb\nc\n", options),
-            RegionsToFormat::LineRanges(vec![line_range(1, 3)])
-        );
-
-        // Deleted base content.
-        assert_eq!(
-            compute_regions_to_format(Some(b"a\nb\nc\nd\n"), b"a\nb\nc\n", options),
-            RegionsToFormat::LineRanges(vec![line_range(1, 3)])
-        );
-
-        // Deleted current content.
-        assert_eq!(
-            compute_regions_to_format(Some(b"a\nb\nc\n"), b"", options),
-            RegionsToFormat::NoRegions
-        );
-    }
-
-    #[test]
-    fn test_compute_regions_to_format_run_tool_if_zero_line_ranges() {
-        let options = ComputeRegionsToFormatOptions {
-            all_lines: false,
-            run_tool_if_zero_line_ranges: true,
-        };
-
-        // Deleted base content.
-        assert_eq!(
-            compute_regions_to_format(Some(b"a\nb\nc\nd\n"), b"a\nb\nc\n", options),
+            compute_regions_to_format(Some(b"a\nb\nc\n"), b""),
             RegionsToFormat::LineRanges(vec![])
-        );
-
-        // Deleted current content.
-        assert_eq!(
-            compute_regions_to_format(Some(b"a\nb\nc\n"), b"", options),
-            RegionsToFormat::NoRegions
         );
     }
 }
